@@ -13,7 +13,6 @@ import os
 import random
 import sys
 import time
-from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +24,8 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam, SGD, lr_scheduler
 from tqdm import tqdm
+
+from nncf.torch import create_compressed_model
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -44,7 +45,7 @@ from utils.downloads import attempt_download
 from utils.loss import ComputeLoss
 from utils.plots import plot_labels, plot_evolve
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, intersect_dicts, select_device, \
-    torch_distributed_zero_first
+    torch_distributed_zero_first, EmaModelManager
 from utils.loggers.wandb.wandb_utils import check_wandb_resume
 from utils.metrics import fitness
 from utils.loggers import Loggers
@@ -131,6 +132,32 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             print(f'freezing {k}')
             v.requires_grad = False
 
+    nncf_config = {
+        "input_info": {
+            "sample_size": [1, 3, 640, 640]
+        },
+        "compression": [
+            {
+                "algorithm": "filter_pruning",
+                "pruning_init": 0.1,
+                "params": {
+                    "schedule": "exponential",
+                    "pruning_flops_target": 0.3,
+                    "pruning_steps": 40,
+                    "filter_importance": "geometric_median",
+                    "prune_downsample_convs": True
+                }
+            }
+        ]
+    }
+    original_modules_names = list(model.state_dict())
+    compr_start = time.time()
+    compression_ctrl, model = create_compressed_model(model, nncf_config)
+    compr_finish = time.time()
+    print(compression_ctrl.statistics().to_str())
+    print(f'Compression initialization time: {compr_finish - compr_start} sec')
+    nncf_modules = [m for m in model.state_dict() if not any([on for on in original_modules_names if on in m])]
+
     # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
@@ -163,9 +190,10 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     else:
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+    # scheduler = lr_scheduler.MultiStepLR(optimizer, [20, 40, 50], gamma=0.45)
 
     # EMA
-    ema = ModelEMA(model) if RANK in [-1, 0] else None
+    ema = ModelEMA(model.state_dict(), nncf_modules) if RANK in [-1, 0] else None
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
@@ -268,6 +296,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 f'Starting training for {epochs} epochs...')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+        compression_ctrl.scheduler.epoch_step(epoch)
 
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
@@ -288,6 +317,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+            compression_ctrl.scheduler.step()
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
@@ -328,7 +358,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 scaler.update()
                 optimizer.zero_grad()
                 if ema:
-                    ema.update(model)
+                    ema.update(model.state_dict())
                 last_opt_step = ni
 
             # Log
@@ -347,36 +377,46 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if RANK in [-1, 0]:
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+            # ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
-            if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = val.run(data_dict,
-                                           batch_size=batch_size // WORLD_SIZE * 2,
-                                           imgsz=imgsz,
-                                           model=ema.ema,
-                                           single_cls=single_cls,
-                                           dataloader=val_loader,
-                                           save_dir=save_dir,
-                                           plots=False,
-                                           callbacks=callbacks,
-                                           compute_loss=compute_loss)
+            with EmaModelManager(model, ema.state_dict) as ema_model:
+                if not noval or final_epoch:  # Calculate mAP
+                    results, maps, _ = val.run(data_dict,
+                                               batch_size=batch_size // WORLD_SIZE * 2,
+                                               imgsz=imgsz,
+                                               model=ema_model,
+                                               single_cls=single_cls,
+                                               dataloader=val_loader,
+                                               save_dir=save_dir,
+                                               plots=False,
+                                               callbacks=callbacks,
+                                               compute_loss=compute_loss)
 
+            print(compression_ctrl.statistics().to_str())
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
+            compression = [compression_ctrl.pruning_rate, compression_ctrl.current_flops]
+            log_vals = list(mloss) + list(results) + lr + compression
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
-                        'model': deepcopy(de_parallel(model)).half(),
-                        'ema': deepcopy(ema.ema).half(),
+                        'state_dict': model.state_dict(),
+                        'compression_state': compression_ctrl.get_compression_state(),
+                        'ema': ema.state_dict,
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None}
+                # ckpt = {
+                #     'state_dict': model.state_dict(),
+                #     'compression_state': compression_ctrl.get_compression_state(),
+                #     'optimizer': optimizer.state_dict(),
+                #     'epoch': epoch,
+                # }
 
                 # Save last, best and delete
                 torch.save(ckpt, last)

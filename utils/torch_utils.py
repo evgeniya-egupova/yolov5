@@ -313,28 +313,44 @@ class ModelEMA:
     GPU assignment and distributed training wrappers.
     """
 
-    def __init__(self, model, decay=0.9999, updates=0):
+    def __init__(self, state_dict, force_substitution=None, decay=0.9999, updates=0):
         # Create EMA
-        self.ema = deepcopy(model.module if is_parallel(model) else model).eval()  # FP32 EMA
-        # if next(model.parameters()).device.type != 'cpu':
-        #     self.ema.half()  # FP16 EMA
+        self.state_dict = state_dict
         self.updates = updates  # number of EMA updates
         self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
-        for p in self.ema.parameters():
-            p.requires_grad_(False)
+        self.force_substitution = force_substitution or []
 
-    def update(self, model):
+    def update(self, state_dict):
         # Update EMA parameters
         with torch.no_grad():
             self.updates += 1
             d = self.decay(self.updates)
 
-            msd = model.module.state_dict() if is_parallel(model) else model.state_dict()  # model state_dict
-            for k, v in self.ema.state_dict().items():
-                if v.dtype.is_floating_point:
+            for k, v in self.state_dict.items():
+                if k in self.force_substitution or not v.dtype.is_floating_point:
+                    self.state_dict[k] = state_dict[k].detach()
+                else:
                     v *= d
-                    v += (1. - d) * msd[k].detach()
+                    v += (1. - d) * state_dict[k].detach()
 
-    def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
-        # Update EMA attributes
-        copy_attr(self.ema, model, include, exclude)
+
+from nncf.torch import load_state
+import weakref
+import gc
+
+
+class EmaModelManager:
+    def __init__(self, model, ema_state_dict):
+        self._model = model
+        self._ema_state_dict = ema_state_dict
+        self._origin_state_dict = None
+
+    def __enter__(self):
+        self._origin_state_dict = deepcopy(self._model.state_dict())
+        load_state(self._model, self._ema_state_dict)
+        return weakref.proxy(self._model)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        load_state(self._model, self._origin_state_dict)
+        del self._model
+        gc.collect()
